@@ -8,6 +8,8 @@ import time
 from enum import Enum
 from typing import Optional
 
+from .failure_detection import check_gpu_health
+
 logger = logging.getLogger(__name__)
 
 RESTART_INTERVAL = 1000
@@ -171,6 +173,12 @@ class PooledKernelEvaluator:
             decides whether to retry.
         """
         with self._lock:
+            healthy, health_err = check_gpu_health(self.gpu_id)
+            if not healthy:
+                logger.warning("GPU %d unhealthy: %s", self.gpu_id, health_err)
+                self.health = ContainerHealth.RECOVERING
+                return None, None
+
             if self._proc is None or self._proc.poll() is not None:
                 self._try_restart()
                 if self._proc is None or self._proc.poll() is not None:
