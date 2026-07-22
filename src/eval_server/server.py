@@ -4,6 +4,7 @@ import json
 import logging
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+from .metrics import metrics
 from .pool import EvalRequest, SharedEvalPool
 
 logger = logging.getLogger(__name__)
@@ -80,6 +81,13 @@ class EvalHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == "/health":
             self._send_json(200, self.pool.get_health())
+        elif self.path == "/metrics":
+            body = metrics.render_prometheus().encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
         else:
             self._send_json(404, {"error": "Not found"})
 

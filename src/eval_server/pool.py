@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from .container import PooledKernelEvaluator
+from .metrics import metrics
 
 logger = logging.getLogger(__name__)
 
@@ -246,6 +247,18 @@ class SharedEvalPool:
                     result = self._infra_failure_result(request, evaluator)
 
             request.set_response_sent()
+
+            metrics.observe_latency(
+                task=request.task_name,
+                gpu=evaluator.gpu_id,
+                latency_seconds=request.eval_time_ms() / 1000.0,
+            )
+            metrics.inc_evals(
+                success=result.get("success", False),
+                error_type=result.get("error_type"),
+            )
+            metrics.set_queue_depth(self._queue.qsize())
+            metrics.set_gpu_state(evaluator.gpu_id, evaluator.health.value)
 
             result["timing"] = request.timing_dict()
             result["metadata"] = {
