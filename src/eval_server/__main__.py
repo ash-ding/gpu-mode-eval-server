@@ -99,7 +99,7 @@ def main():
 
     num_gpus = len(gpu_ids)
     max_queue_depth = num_gpus * 8
-    request_timeout = max_queue_depth * args.timeout + 60
+    request_timeout = (max_queue_depth // num_gpus + 1) * args.timeout + 60
     thread_pool_size = max(num_gpus * 128, 512)
 
     pool = SharedEvalPool(evaluators, gpu_names, eval_timeout=args.timeout)

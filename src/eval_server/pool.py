@@ -99,7 +99,7 @@ class SharedEvalPool:
         self._queue: queue.Queue[EvalRequest] = queue.Queue(maxsize=max_depth)
         self._max_queue_depth = max_depth
 
-        self._request_timeout = max_depth * eval_timeout + 60
+        self._request_timeout = (max_depth // num_gpus + 1) * eval_timeout + 60
 
         self._workers: list[threading.Thread] = []
         self._running = False
@@ -203,6 +203,11 @@ class SharedEvalPool:
                     try:
                         self._queue.put_nowait(request)
                     except queue.Full:
+                        logger.warning(
+                            'Requeue failed due to full queue for GPU type %s. '
+                            'Pathological state: all GPUs wrong type AND queue saturated.',
+                            request.gpu_type,
+                        )
                         request.result = self._gpu_mismatch_result(request, evaluator)
                         request.set_response_sent()
                         request.done.set()

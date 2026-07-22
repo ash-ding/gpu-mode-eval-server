@@ -188,7 +188,7 @@ class PooledKernelEvaluator:
 
             if self._proc.poll() is not None and self._proc.returncode != 0:
                 logger.error(
-                    "Container exited with code %d for GPU %d",
+                    "Container exited with code %d before JSON parse for GPU %d",
                     self._proc.returncode, self.gpu_id,
                 )
                 self.health = ContainerHealth.RECOVERING
