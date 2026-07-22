@@ -25,7 +25,7 @@ class FakeEvaluator:
     def stop(self):
         pass
 
-    def evaluate(self, code, task_name):
+    def evaluate(self, code, task_name, same_container_retry=0):
         return {
             "success": True,
             "score_us": 42.0,
@@ -45,7 +45,7 @@ class FakeEvaluator:
                 "geom_mean_us": 42.0,
                 "individual_runs": [{"benchmark_id": 0, "config": "default", "time_us": 42.0}],
             },
-        }
+        }, None
 
     def get_status(self):
         return {
@@ -259,7 +259,7 @@ class TestPartialTestPassReporting(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         evaluator = FakeEvaluator(0)
-        evaluator.evaluate = lambda code, task_name: {
+        evaluator.evaluate = lambda code, task_name, same_container_retry=0: ({
             "success": False,
             "score_us": -1_000_000.0,
             "error": "2/17 tests failed",
@@ -274,7 +274,7 @@ class TestPartialTestPassReporting(unittest.TestCase):
                 ],
             },
             "benchmark_details": None,
-        }
+        }, None)
 
         gpu_names = {0: "NVIDIA H100"}
         cls.pool = SharedEvalPool([evaluator], gpu_names, eval_timeout=10)
@@ -325,7 +325,7 @@ class TestQueue503(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         evaluator = FakeEvaluator(0)
-        evaluator.evaluate = lambda code, task_name: (time.sleep(2), {
+        evaluator.evaluate = lambda code, task_name, same_container_retry=0: (time.sleep(2), ({
             "success": True,
             "score_us": 1.0,
             "error": None,
@@ -333,7 +333,7 @@ class TestQueue503(unittest.TestCase):
             "logs": {"stdout": "", "stderr": "", "compilation_log": "", "traceback": None},
             "test_results": {"passed": 1, "failed": 0, "total": 1, "first_failure": None, "details": []},
             "benchmark_details": None,
-        })[1]
+        }, None))[-1]
 
         gpu_names = {0: "GPU"}
         cls.pool = SharedEvalPool([evaluator], gpu_names, eval_timeout=10)

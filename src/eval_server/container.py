@@ -12,6 +12,24 @@ logger = logging.getLogger(__name__)
 
 RESTART_INTERVAL = 1000
 
+KERNEL_BUG_SIGNALS = {
+    -9: "SIGKILL/OOM",
+    -11: "SIGSEGV",
+    -6: "SIGABRT",
+}
+
+
+def check_crash_signature(returncode: int) -> tuple[str, bool]:
+    """Classify a crash by its signal.
+
+    Returns (description, is_kernel_bug).
+    Kernel bugs (OOM, segfault, abort) are definitive eval failures —
+    retrying won't help.
+    """
+    if returncode in KERNEL_BUG_SIGNALS:
+        return KERNEL_BUG_SIGNALS[returncode], True
+    return f"exit code {returncode}", False
+
 
 class ContainerHealth(Enum):
     HEALTHY = "healthy"
@@ -96,7 +114,7 @@ class PooledKernelEvaluator:
         self.health = ContainerHealth.HEALTHY
         self.eval_count = 0
         self.restart_count = 0
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self._proc: Optional[subprocess.Popen] = None
         self._container_name = f"eval-gpu-{gpu_id}"
 
@@ -144,14 +162,20 @@ class PooledKernelEvaluator:
             self._proc.wait(timeout=5)
         self._proc = None
 
-    def evaluate(self, code: str, task_name: str) -> Optional[dict]:
-        """Send an eval request and return the result, or None on infra failure."""
+    def evaluate(self, code: str, task_name: str, same_container_retry: int = 0) -> tuple[Optional[dict], Optional[int]]:
+        """Send an eval request and return (result, crash_signal).
+
+        Returns:
+            (result_dict, None) on success or definitive eval failure.
+            (None, returncode) on infrastructure failure — the caller
+            decides whether to retry.
+        """
         with self._lock:
             if self._proc is None or self._proc.poll() is not None:
                 self._try_restart()
                 if self._proc is None or self._proc.poll() is not None:
                     self.health = ContainerHealth.FAILED
-                    return None
+                    return None, None
 
             if self.eval_count > 0 and self.eval_count % RESTART_INTERVAL == 0:
                 logger.info(
@@ -161,7 +185,7 @@ class PooledKernelEvaluator:
                 self._try_restart()
                 if self._proc is None or self._proc.poll() is not None:
                     self.health = ContainerHealth.FAILED
-                    return None
+                    return None, None
 
             request = json.dumps({"code": code, "task_name": task_name}) + "\n"
 
@@ -171,7 +195,7 @@ class PooledKernelEvaluator:
             except (BrokenPipeError, OSError):
                 logger.error("Container stdin broken for GPU %d", self.gpu_id)
                 self.health = ContainerHealth.RECOVERING
-                return None
+                return None, None
 
             try:
                 response_line = self._read_with_timeout(self.timeout)
@@ -179,31 +203,51 @@ class PooledKernelEvaluator:
                 logger.error("Container timeout for GPU %d", self.gpu_id)
                 self.health = ContainerHealth.RECOVERING
                 self._kill_existing()
-                return None
+                return None, None
 
             if response_line is None:
                 logger.error("Container stdout closed for GPU %d", self.gpu_id)
                 self.health = ContainerHealth.RECOVERING
-                return None
+                returncode = self._proc.returncode if self._proc.poll() is not None else None
+                return None, returncode
 
             if self._proc.poll() is not None and self._proc.returncode != 0:
+                returncode = self._proc.returncode
+                desc, is_kernel_bug = check_crash_signature(returncode)
                 logger.error(
-                    "Container exited with code %d before JSON parse for GPU %d",
-                    self._proc.returncode, self.gpu_id,
+                    "Container exited with %s (code %d) for GPU %d",
+                    desc, returncode, self.gpu_id,
                 )
                 self.health = ContainerHealth.RECOVERING
-                return None
+
+                if is_kernel_bug:
+                    return {
+                        "success": False,
+                        "score_us": -1_000_000.0,
+                        "error": f"Kernel crashed with {desc}",
+                        "error_type": "eval_failure",
+                        "logs": {"stdout": "", "stderr": response_line, "compilation_log": "", "traceback": None},
+                        "test_results": {"passed": 0, "failed": 0, "total": 0, "first_failure": None, "details": []},
+                        "benchmark_details": None,
+                    }, returncode
+
+                if same_container_retry == 0:
+                    logger.info("Container crashed (code %d), restarting and retrying on same GPU %d", returncode, self.gpu_id)
+                    self._try_restart()
+                    return self.evaluate(code, task_name, same_container_retry=1)
+
+                return None, returncode
 
             try:
                 result = json.loads(response_line)
             except json.JSONDecodeError:
                 logger.error("Invalid JSON from container GPU %d: %s", self.gpu_id, response_line[:200])
                 self.health = ContainerHealth.RECOVERING
-                return None
+                return None, None
 
             self.eval_count += 1
             self.health = ContainerHealth.HEALTHY
-            return result
+            return result, None
 
     def _read_with_timeout(self, timeout: int) -> Optional[str]:
         """Read a line from container stdout with timeout."""

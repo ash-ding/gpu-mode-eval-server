@@ -27,11 +27,11 @@ class FakeEvaluator:
     def stop(self):
         pass
 
-    def evaluate(self, code, task_name):
+    def evaluate(self, code, task_name, same_container_retry=0):
         if self._delay:
             time.sleep(self._delay)
         self.eval_count += 1
-        return self._result
+        return self._result, None
 
     def get_status(self):
         return {
@@ -87,10 +87,10 @@ class TestRequeueOnInfraFailure(unittest.TestCase):
         call_count = [0]
 
         class FailOnceEvaluator(FakeEvaluator):
-            def evaluate(self, code, task_name):
+            def evaluate(self, code, task_name, same_container_retry=0):
                 call_count[0] += 1
                 if call_count[0] == 1:
-                    return None  # Infra failure
+                    return None, None
                 return {
                     "success": True,
                     "score_us": 42.0,
@@ -99,7 +99,7 @@ class TestRequeueOnInfraFailure(unittest.TestCase):
                     "logs": {"stdout": "", "stderr": "", "compilation_log": "", "traceback": None},
                     "test_results": {"passed": 1, "failed": 0, "total": 1, "first_failure": None, "details": []},
                     "benchmark_details": None,
-                }
+                }, None
 
         evaluator = FailOnceEvaluator(0)
         pool = SharedEvalPool([evaluator], {0: "GPU"}, eval_timeout=10)

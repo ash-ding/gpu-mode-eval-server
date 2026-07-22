@@ -26,6 +26,9 @@ class EvalRequest:
         self.task_name = task_name
         self.gpu_type = gpu_type
         self.retry_count = 0
+        self.same_container_retry = 0
+        self.different_gpu_retry = 0
+        self.crash_signal: Optional[int] = None
         self.result: Optional[dict] = None
         self.done = threading.Event()
 
@@ -214,14 +217,22 @@ class SharedEvalPool:
                     continue
 
             request.set_eval_started()
-            result = evaluator.evaluate(request.code, request.task_name)
+            result, crash_signal = evaluator.evaluate(
+                request.code, request.task_name,
+                same_container_retry=request.same_container_retry,
+            )
             request.set_eval_completed()
+
+            if crash_signal is not None:
+                request.crash_signal = crash_signal
+                request.same_container_retry = 1
 
             if result is None:
                 request.retry_count += 1
+                request.different_gpu_retry += 1
                 if request.retry_count < MAX_INFRA_RETRIES:
                     logger.warning(
-                        "Infra failure on GPU %d, requeuing (attempt %d/%d)",
+                        "Infra failure on GPU %d, requeuing to different GPU (attempt %d/%d)",
                         evaluator.gpu_id, request.retry_count, MAX_INFRA_RETRIES,
                     )
                     try:
@@ -242,6 +253,9 @@ class SharedEvalPool:
                 "gpu_name": self.gpu_names.get(evaluator.gpu_id, "unknown"),
                 "container_restarts": evaluator.restart_count,
                 "retry_count": request.retry_count,
+                "same_container_retry": request.same_container_retry,
+                "different_gpu_retry": request.different_gpu_retry,
+                "crash_signal": request.crash_signal,
             }
 
             request.result = result

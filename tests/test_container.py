@@ -71,25 +71,70 @@ class TestContainerReturncodeValidation(unittest.TestCase):
 
     @patch.object(PooledKernelEvaluator, "_kill_existing")
     @patch.object(PooledKernelEvaluator, "start")
-    def test_nonzero_returncode_returns_none(self, mock_start, mock_kill):
+    def test_kernel_bug_returncode_returns_eval_failure(self, mock_start, mock_kill):
+        """OOM (returncode -9) is classified as eval_failure, not retried."""
         runtime = ContainerRuntime.__new__(ContainerRuntime)
         runtime.runtime = "podman"
         evaluator = PooledKernelEvaluator(0, runtime, "test:latest")
         evaluator.health = ContainerHealth.HEALTHY
 
         mock_proc = MagicMock()
-        mock_proc.poll.side_effect = [None, 1]  # alive during write, dead after read
+        mock_proc.poll.side_effect = [None, -9]
+        mock_proc.returncode = -9
+        mock_proc.stdin.write.return_value = None
+        mock_proc.stdin.flush.return_value = None
+        evaluator._proc = mock_proc
+
+        with patch.object(evaluator, "_read_with_timeout", return_value='partial output'):
+            result, crash_signal = evaluator.evaluate("code", "task")
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result["error_type"], "eval_failure")
+        self.assertIn("SIGKILL/OOM", result["error"])
+        self.assertEqual(crash_signal, -9)
+        self.assertEqual(evaluator.health, ContainerHealth.RECOVERING)
+
+    @patch.object(PooledKernelEvaluator, "_kill_existing")
+    @patch.object(PooledKernelEvaluator, "start")
+    def test_nonkernel_crash_triggers_same_container_retry(self, mock_start, mock_kill):
+        """Non-kernel-bug crash (e.g. exit code 1) triggers same-container retry."""
+        runtime = ContainerRuntime.__new__(ContainerRuntime)
+        runtime.runtime = "podman"
+        evaluator = PooledKernelEvaluator(0, runtime, "test:latest")
+        evaluator.health = ContainerHealth.HEALTHY
+
+        mock_proc = MagicMock()
+        mock_proc.poll.side_effect = [None, 1, None, None]
         mock_proc.returncode = 1
         mock_proc.stdin.write.return_value = None
         mock_proc.stdin.flush.return_value = None
-        mock_proc.stdout.readline.return_value = '{"success": true}\n'
         evaluator._proc = mock_proc
 
-        with patch.object(evaluator, "_read_with_timeout", return_value='{"success": true}'):
-            result = evaluator.evaluate("code", "task")
+        call_count = [0]
+        def fake_read(timeout):
+            call_count[0] += 1
+            if call_count[0] == 1:
+                return 'partial output'
+            return '{"success": true, "score_us": 42.0}'
 
-        self.assertIsNone(result)
-        self.assertEqual(evaluator.health, ContainerHealth.RECOVERING)
+        with patch.object(evaluator, "_read_with_timeout", side_effect=fake_read):
+            mock_proc.poll.side_effect = [None, 1, None, None]
+            mock_proc2 = MagicMock()
+            mock_proc2.poll.return_value = None
+            mock_proc2.returncode = 0
+            mock_proc2.stdin.write.return_value = None
+            mock_proc2.stdin.flush.return_value = None
+
+            def restart_side_effect():
+                evaluator._proc = mock_proc2
+                evaluator.health = ContainerHealth.RECOVERING
+                evaluator.restart_count += 1
+
+            with patch.object(evaluator, "_try_restart", side_effect=restart_side_effect):
+                result, crash_signal = evaluator.evaluate("code", "task")
+
+        self.assertIsNotNone(result)
+        self.assertTrue(result["success"])
 
 
 class TestPeriodicRestart(unittest.TestCase):
