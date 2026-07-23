@@ -54,6 +54,23 @@ logging:
         self.assertEqual(config["container"]["image"], "eval-server:v2")
         self.assertEqual(config["logging"]["format"], "json")
 
+    def test_load_missing_file_exits(self):
+        with self.assertRaises(SystemExit) as ctx:
+            load_config("/tmp/nonexistent_config_xyz_42.yaml")
+        self.assertEqual(ctx.exception.code, 1)
+
+    def test_load_malformed_yaml_exits(self):
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".yml", delete=False) as f:
+            f.write(":\n  - :\n  bad: [unclosed\n")
+            f.flush()
+            path = f.name
+        try:
+            with self.assertRaises(SystemExit) as ctx:
+                load_config(path)
+            self.assertEqual(ctx.exception.code, 1)
+        finally:
+            os.unlink(path)
+
 
 class FakeArgs:
     """Mock argparse namespace for testing merge logic."""
@@ -70,9 +87,9 @@ class FakeArgs:
 
 
 class TestMergeConfigWithArgs(unittest.TestCase):
-    """Test config/CLI merge logic — CLI args win over defaults."""
+    """Test config/CLI merge logic — CLI args always take precedence."""
 
-    def test_config_values_used_when_args_are_defaults(self):
+    def test_cli_defaults_override_config(self):
         config = {
             "server": {"host": "127.0.0.1", "port": 9090},
             "gpus": {"ids": [0, 1], "timeout": 600},
@@ -82,13 +99,12 @@ class TestMergeConfigWithArgs(unittest.TestCase):
         args = FakeArgs()
         merged = merge_config_with_args(config, args)
 
-        self.assertEqual(merged["host"], "127.0.0.1")
-        self.assertEqual(merged["port"], 9090)
-        self.assertEqual(merged["gpus"], [0, 1])
-        self.assertEqual(merged["timeout"], 600)
-        self.assertEqual(merged["image"], "eval:v2")
-        self.assertEqual(merged["log_level"], "DEBUG")
-        self.assertEqual(merged["log_format"], "json")
+        self.assertEqual(merged["host"], "0.0.0.0")
+        self.assertEqual(merged["port"], 8080)
+        self.assertEqual(merged["timeout"], 530)
+        self.assertEqual(merged["image"], "eval-server:latest")
+        self.assertEqual(merged["log_level"], "INFO")
+        self.assertEqual(merged["log_format"], "text")
 
     def test_cli_args_override_config(self):
         config = {
@@ -100,6 +116,12 @@ class TestMergeConfigWithArgs(unittest.TestCase):
 
         self.assertEqual(merged["port"], 7070)
         self.assertEqual(merged["gpus"], [2, 3])
+
+    def test_cli_default_value_overrides_config(self):
+        config = {"server": {"port": 9999}}
+        args = FakeArgs(port=8080)
+        merged = merge_config_with_args(config, args)
+        self.assertEqual(merged["port"], 8080)
 
     def test_empty_config(self):
         merged = merge_config_with_args({}, FakeArgs())

@@ -93,8 +93,17 @@ class EvalClient:
                     raise ConnectionError(
                         f"Server returned 503 after {self.max_retries} retries"
                     ) from e
-                body = json.loads(e.read().decode("utf-8"))
-                return EvalResult(body)
+                try:
+                    response_body = e.read().decode("utf-8")
+                    body = json.loads(response_body)
+                    return EvalResult(body)
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    return EvalResult({
+                        "success": False,
+                        "score_us": -1_000_000.0,
+                        "error": f"HTTP {e.code}: {e.reason}",
+                        "error_type": "http_error",
+                    })
 
             except URLError as e:
                 if attempt < self.max_retries - 1:

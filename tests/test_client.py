@@ -228,5 +228,43 @@ class TestEvalClientRetry(unittest.TestCase):
             client.eval(code="x", task_name="t")
 
 
+class HtmlErrorHandler(BaseHTTPRequestHandler):
+    """Mock server that returns HTML error responses."""
+
+    def do_POST(self):
+        self.send_response(500)
+        body = b"<html><body><h1>500 Internal Server Error</h1></body></html>"
+        self.send_header("Content-Type", "text/html")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, format, *args):
+        pass
+
+
+class TestEvalClientNonJsonError(unittest.TestCase):
+    """Test client handles non-JSON HTTP error responses."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.server = HTTPServer(("127.0.0.1", 18102), HtmlErrorHandler)
+        cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
+        cls.thread.start()
+        time.sleep(0.1)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+
+    def test_html_error_returns_eval_result(self):
+        client = EvalClient("http://127.0.0.1:18102", max_retries=1)
+        result = client.eval(code="x", task_name="t")
+        self.assertIsInstance(result, EvalResult)
+        self.assertFalse(result.success)
+        self.assertEqual(result.error_type, "http_error")
+        self.assertIn("500", result.error)
+
+
 if __name__ == "__main__":
     unittest.main()
