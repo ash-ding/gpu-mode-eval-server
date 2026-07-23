@@ -477,6 +477,528 @@ gpu-mode-eval-server/
 └── pyproject.toml                # Package configuration
 ```
 
+### Adding New Benchmark Tasks
+
+The eval server uses a task-based architecture that makes it easy to add new GPU kernel benchmarks. Each task is self-contained in its own directory under `lib/tasks/`.
+
+#### Task Structure
+
+Each task directory must contain:
+
+```
+lib/tasks/my_new_task/
+├── task.yml          # Task configuration (required)
+├── task.py           # Task interface (required)
+├── eval.py           # Evaluation harness (required)
+├── reference.py      # Reference implementation (required)
+├── submission.py     # Submission template (required)
+└── utils.py          # Helper functions (optional)
+```
+
+#### Step-by-Step Guide
+
+**1. Create Task Directory**
+
+```bash
+mkdir lib/tasks/my_new_task
+cd lib/tasks/my_new_task
+```
+
+**2. Write `task.yml` Configuration**
+
+```yaml
+# lib/tasks/my_new_task/task.yml
+
+files:
+  - {"name": "submission.py", "source": "@SUBMISSION@"}
+  - {"name": "task.py", "source": "task.py"}
+  - {"name": "utils.py", "source": "utils.py"}
+  - {"name": "reference.py", "source": "reference.py"}
+  - {"name": "eval.py", "source": "eval.py"}
+
+lang: "py"
+
+description: |
+  Brief description of what this benchmark measures.
+  
+  Input format:
+  - Describe inputs here
+  
+  Output format:
+  - Describe expected outputs here
+
+config:
+  main: "eval.py"
+
+templates:
+  Python: "submission.py"
+
+test_timeout: 1200       # Max seconds for all tests
+benchmark_timeout: 1200  # Max seconds for all benchmarks
+ranked_timeout: 1200     # Max seconds for ranking
+ranking_by: "geom"       # "geom" (geometric mean) or "sum"
+
+# Test cases (for correctness verification)
+tests:
+  - {"param1": 32, "param2": 128, "seed": 1234}
+  - {"param1": 64, "param2": 256, "seed": 5678}
+  # Add 10-20 test cases covering edge cases
+
+# Benchmark cases (for performance measurement)
+benchmarks:
+  - {"param1": 256, "param2": 512, "seed": 1234}
+  - {"param1": 512, "param2": 1024, "seed": 5678}
+  # Add 5-10 benchmark cases representing realistic workloads
+```
+
+**3. Implement `task.py` Interface**
+
+```python
+# lib/tasks/my_new_task/task.py
+
+import torch
+
+class Task:
+    """Task interface for my_new_task."""
+    
+    def __init__(self, **config):
+        """Initialize task with test/benchmark config."""
+        self.param1 = config["param1"]
+        self.param2 = config["param2"]
+        self.seed = config.get("seed", 0)
+        
+    def prepare_data(self) -> tuple:
+        """Generate input data for this test case."""
+        torch.manual_seed(self.seed)
+        # Generate inputs based on self.param1, self.param2, etc.
+        input_tensor = torch.randn(self.param1, self.param2, device="cuda")
+        return (input_tensor,)
+    
+    def check_output(self, output, reference_output) -> bool:
+        """Verify output correctness."""
+        return torch.allclose(output, reference_output, rtol=1e-3, atol=1e-5)
+```
+
+**4. Implement `reference.py` Ground Truth**
+
+```python
+# lib/tasks/my_new_task/reference.py
+
+import torch
+
+def reference_solution(input_tensor):
+    """Reference implementation (doesn't need to be fast)."""
+    # Implement the correct algorithm here
+    # This is the ground truth for correctness checking
+    result = input_tensor * 2  # Example
+    return result
+```
+
+**5. Implement `eval.py` Harness**
+
+```python
+# lib/tasks/my_new_task/eval.py
+
+import torch
+from task import Task
+from reference import reference_solution
+
+def run_tests(submission_fn, tests):
+    """Run correctness tests."""
+    passed = 0
+    failed_tests = []
+    
+    for i, test_config in enumerate(tests):
+        task = Task(**test_config)
+        inputs = task.prepare_data()
+        
+        # Run submission
+        try:
+            output = submission_fn(*inputs)
+        except Exception as e:
+            failed_tests.append({"test_id": i, "error": str(e)})
+            continue
+        
+        # Check correctness
+        reference_output = reference_solution(*inputs)
+        if task.check_output(output, reference_output):
+            passed += 1
+        else:
+            failed_tests.append({"test_id": i, "error": "Output mismatch"})
+    
+    return {
+        "passed": passed,
+        "failed": len(failed_tests),
+        "total": len(tests),
+        "first_failure": failed_tests[0] if failed_tests else None,
+        "details": failed_tests,
+    }
+
+def run_benchmarks(submission_fn, benchmarks):
+    """Run performance benchmarks."""
+    results = []
+    
+    for i, bench_config in enumerate(benchmarks):
+        task = Task(**bench_config)
+        inputs = task.prepare_data()
+        
+        # Warmup
+        for _ in range(3):
+            submission_fn(*inputs)
+        torch.cuda.synchronize()
+        
+        # Benchmark (10 runs)
+        times = []
+        for _ in range(10):
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+            
+            start.record()
+            submission_fn(*inputs)
+            end.record()
+            
+            torch.cuda.synchronize()
+            times.append(start.elapsed_time(end) * 1000)  # Convert to microseconds
+        
+        median_time = sorted(times)[len(times) // 2]
+        results.append({
+            "benchmark_id": i,
+            "config": bench_config,
+            "time_us": median_time,
+        })
+    
+    return results
+```
+
+**6. Create `submission.py` Template**
+
+```python
+# lib/tasks/my_new_task/submission.py
+
+import torch
+
+def kernel(input_tensor):
+    """
+    User implements this function.
+    
+    Args:
+        input_tensor: Input tensor of shape [param1, param2]
+    
+    Returns:
+        Output tensor of same shape
+    """
+    # TODO: Implement optimized kernel here
+    raise NotImplementedError("Implement this kernel")
+```
+
+**7. Update Server to Load New Task**
+
+The server auto-discovers tasks in `lib/tasks/` — no code changes needed! Just restart the server:
+
+```bash
+python -m eval_server --gpus 0,1,2,3 --tasks-dir ./lib/tasks
+```
+
+**8. Test Your New Task**
+
+```python
+from eval_server.client import EvalClient
+
+client = EvalClient("http://localhost:8080")
+
+kernel_code = """
+import torch
+
+def kernel(input_tensor):
+    return input_tensor * 2  # Your optimized implementation
+"""
+
+result = client.eval(
+    code=kernel_code,
+    task_name="my_new_task",  # Your task name (directory name)
+    gpu_type="H100"
+)
+
+print(f"Tests: {result.test_results['passed']}/{result.test_results['total']}")
+print(f"Score: {result.score_us} µs")
+```
+
+#### Task Design Best Practices
+
+1. **Test Coverage**: Include 10-20 test cases covering:
+   - Small inputs (fast tests)
+   - Edge cases (empty, single element, max size)
+   - Different data distributions
+   - Masked vs unmasked scenarios
+
+2. **Benchmark Selection**: Choose 5-10 benchmarks representing:
+   - Realistic workload sizes
+   - Range of input shapes
+   - Performance-critical configurations
+
+3. **Timeout Tuning**: Set timeouts based on expected runtime:
+   - Fast kernels (<10s): `test_timeout: 600` (10 min)
+   - Slow kernels (30s-2min): `test_timeout: 1200` (20 min)
+   - Very slow kernels: `test_timeout: 3600` (1 hour)
+
+4. **Ranking Metric**:
+   - `ranking_by: "geom"` — geometric mean (default, handles wide range of times)
+   - `ranking_by: "sum"` — sum of all benchmark times
+
+5. **Reference Implementation**: Prioritize correctness over performance. Use PyTorch built-ins when possible.
+
+---
+
+## Server-Side Logging and Audit Trail
+
+The eval server maintains comprehensive logs of all evaluation requests and results, useful for debugging, monitoring, and audit purposes.
+
+### Log Formats
+
+The server supports two log formats via `--log-format`:
+
+**Text Format (Default)**
+```
+2026-07-23 15:30:45 INFO Starting eval server with GPUs: [0, 1, 2, 3]
+2026-07-23 15:30:46 INFO GPU 0: NVIDIA H100 80GB HBM3
+2026-07-23 15:30:47 INFO Eval pool started: 4 GPUs, queue depth 32
+```
+
+**JSON Format (Recommended for Production)**
+```bash
+python -m eval_server --log-format json
+```
+
+```json
+{"timestamp": "2026-07-23T15:30:45.123Z", "level": "INFO", "message": "Starting eval server with GPUs: [0, 1, 2, 3]", "logger": "eval_server"}
+{"timestamp": "2026-07-23T15:30:46.456Z", "level": "INFO", "message": "GPU 0: NVIDIA H100 80GB HBM3", "logger": "eval_server"}
+{"timestamp": "2026-07-23T15:30:47.789Z", "level": "INFO", "message": "Eval pool started: 4 GPUs, queue depth 32", "logger": "eval_server.pool"}
+```
+
+### What Gets Logged
+
+**1. Server Lifecycle Events**
+- Server startup/shutdown
+- GPU detection and worker initialization
+- Container lifecycle (start, restart, health status changes)
+
+**2. Request Processing**
+- Queue depth warnings (when queue is filling up)
+- GPU type mismatch warnings
+- Retry attempts (same-container and different-GPU retries)
+- Infrastructure failures
+
+**3. Error Conditions**
+- Container crashes with signal information
+- Evaluation timeouts
+- Queue saturation events
+- GPU health check failures
+
+### Accessing Logs
+
+**Real-time Log Streaming**
+```bash
+# Text format (human-readable)
+python -m eval_server --gpus 0,1,2,3 2>&1 | tee server.log
+
+# JSON format (machine-parseable)
+python -m eval_server --gpus 0,1,2,3 --log-format json 2>&1 | tee server.jsonl
+```
+
+**Filtering JSON Logs**
+```bash
+# Find all errors
+jq 'select(.level == "ERROR")' server.jsonl
+
+# Find all retry attempts
+jq 'select(.message | contains("requeuing"))' server.jsonl
+
+# Find all evals for a specific task
+jq 'select(.task_name == "trimul")' server.jsonl
+
+# Track a specific request by ID
+jq 'select(.request_id == "req_abc123")' server.jsonl
+```
+
+### Response Payload — Complete Audit Trail
+
+Every evaluation returns a comprehensive response with full audit information:
+
+```python
+result = client.eval(code=kernel_code, task_name="trimul")
+
+# All information is in the response
+print(result.response)
+```
+
+**Response Fields:**
+
+1. **Outcome**
+   - `success`: True/False
+   - `error`: Error message (if failed)
+   - `error_type`: Category (compilation_error, eval_failure, timeout, etc.)
+
+2. **Performance Metrics**
+   - `score_us`: Geometric mean benchmark time in microseconds
+   - `benchmark_details`: Individual benchmark runs with times
+
+3. **Logs and Debug Info**
+   - `logs.stdout`: Standard output from kernel execution
+   - `logs.stderr`: Standard error output
+   - `logs.compilation_log`: Triton compilation output
+   - `logs.traceback`: Full Python traceback (if error)
+
+4. **Test Results**
+   - `test_results.passed`: Number of tests passed
+   - `test_results.failed`: Number of tests failed
+   - `test_results.total`: Total test count
+   - `test_results.first_failure`: Details of first failing test
+   - `test_results.details`: Full list of all test results
+
+5. **Timing Breakdown** (5 checkpoints)
+   - `timing.queue_time_ms`: Time spent waiting in queue
+   - `timing.eval_time_ms`: Time spent in evaluation
+   - `timing.total_time_ms`: End-to-end latency
+   - `timing.timestamps`: All 6 lifecycle timestamps
+     - `received`: Request received by server
+     - `queued`: Request added to queue
+     - `gpu_assigned`: GPU worker picked up request
+     - `eval_started`: Evaluation began
+     - `eval_completed`: Evaluation finished
+     - `response_sent`: Response sent to client
+
+6. **Infrastructure Metadata**
+   - `metadata.gpu_id`: Which GPU handled this request
+   - `metadata.gpu_name`: GPU model name (e.g., "NVIDIA H100 80GB HBM3")
+   - `metadata.container_restarts`: How many times container restarted
+   - `metadata.retry_count`: Total retry attempts
+   - `metadata.same_container_retry`: Same-container retry count
+   - `metadata.different_gpu_retry`: Different-GPU retry count
+   - `metadata.crash_signal`: Crash signal if container crashed (e.g., "SIGKILL/OOM")
+
+### Persistent Audit Trail
+
+**Option 1: Save Responses to Database**
+
+```python
+import sqlite3
+import json
+from datetime import datetime
+
+db = sqlite3.connect("eval_audit.db")
+db.execute("""
+    CREATE TABLE IF NOT EXISTS evals (
+        id INTEGER PRIMARY KEY,
+        timestamp TEXT,
+        task_name TEXT,
+        success BOOLEAN,
+        score_us REAL,
+        gpu_id INTEGER,
+        queue_time_ms REAL,
+        eval_time_ms REAL,
+        error_type TEXT,
+        full_response TEXT
+    )
+""")
+
+# After each eval
+result = client.eval(code=kernel_code, task_name="trimul")
+db.execute("""
+    INSERT INTO evals (timestamp, task_name, success, score_us, gpu_id, 
+                       queue_time_ms, eval_time_ms, error_type, full_response)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+""", (
+    datetime.utcnow().isoformat(),
+    "trimul",
+    result.success,
+    result.score_us,
+    result.response["metadata"]["gpu_id"],
+    result.get_queue_time(),
+    result.get_eval_time(),
+    result.error_type,
+    json.dumps(result.response),
+))
+db.commit()
+```
+
+**Option 2: Append to JSONL File**
+
+```python
+import json
+from datetime import datetime
+
+def log_eval(result, task_name, kernel_id):
+    """Append eval result to audit log."""
+    with open("eval_audit.jsonl", "a") as f:
+        record = {
+            "timestamp": datetime.utcnow().isoformat(),
+            "task_name": task_name,
+            "kernel_id": kernel_id,
+            "result": result.response,
+        }
+        f.write(json.dumps(record) + "\n")
+
+# Usage
+result = client.eval(code=kernel_code, task_name="trimul")
+log_eval(result, "trimul", kernel_id="v1.2.3")
+```
+
+**Option 3: Server-Side Logging to File**
+
+```bash
+# Redirect all server logs to file with timestamps
+python -m eval_server --log-format json 2>&1 | \
+  jq -c '. + {written_at: now | todate}' >> /var/log/eval-server.jsonl
+```
+
+### Log Retention and Analysis
+
+**Daily Log Rotation**
+```bash
+# Run server with logrotate
+python -m eval_server --log-format json 2>&1 | \
+  rotatelogs /var/log/eval-server-%Y-%m-%d.jsonl 86400
+```
+
+**Query Historical Data**
+```bash
+# How many evals per day last week?
+cat /var/log/eval-server-2026-07-*.jsonl | \
+  jq -s 'group_by(.timestamp[:10]) | map({date: .[0].timestamp[:10], count: length})'
+
+# What's the P95 queue time?
+cat /var/log/eval-server-today.jsonl | \
+  jq -s 'map(.queue_time_ms) | sort | .[length * 0.95 | floor]'
+```
+
+### Integration with Monitoring Systems
+
+**Prometheus Metrics** (already built-in via `/metrics`)
+- Real-time metrics for queue depth, latency, error rates
+- See [Monitoring](#monitoring) section above
+
+**Grafana Dashboards**
+- Visualize queue depth over time
+- Track P50/P95/P99 latency
+- Alert on error rate spikes
+
+**ELK Stack** (Elasticsearch, Logstash, Kibana)
+```bash
+# Ship JSON logs to Logstash
+python -m eval_server --log-format json 2>&1 | \
+  nc logstash-server 5000
+```
+
+**CloudWatch / Datadog**
+```python
+# Add instrumentation to client code
+import datadog
+
+result = client.eval(code=kernel_code, task_name="trimul")
+datadog.statsd.histogram("eval.latency", result.get_eval_time(), tags=[f"task:{task_name}"])
+datadog.statsd.increment("eval.count", tags=[f"success:{result.success}"])
+```
+
 ---
 
 ## Performance Characteristics
