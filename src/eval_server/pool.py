@@ -1,5 +1,6 @@
 """Shared eval pool — bounded queue with per-GPU worker threads."""
 
+import hashlib
 import logging
 import queue
 import threading
@@ -14,16 +15,35 @@ logger = logging.getLogger(__name__)
 
 MAX_INFRA_RETRIES = 3
 
+# Request counter for generating unique IDs
+_request_counter = 0
+_request_counter_lock = threading.Lock()
+
+
+def _generate_request_id() -> str:
+    """Generate a unique request ID."""
+    global _request_counter
+    with _request_counter_lock:
+        _request_counter += 1
+        return f"req_{_request_counter:06d}"
+
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _code_hash(code: str) -> str:
+    """Generate a short hash of the code for logging."""
+    return hashlib.sha256(code.encode()).hexdigest()[:8]
 
 
 class EvalRequest:
     """A single evaluation request with timing metadata."""
 
     def __init__(self, code: str, task_name: str, gpu_type: Optional[str] = None):
+        self.request_id = _generate_request_id()
         self.code = code
+        self.code_hash = _code_hash(code)
         self.task_name = task_name
         self.gpu_type = gpu_type
         self.retry_count = 0
@@ -199,6 +219,16 @@ class SharedEvalPool:
             if not request.code:
                 continue
 
+            # Log request received by worker
+            logger.info(
+                "Request received: request_id=%s task=%s gpu_type=%s code_hash=%s queue_depth=%d",
+                request.request_id,
+                request.task_name,
+                request.gpu_type or "any",
+                request.code_hash,
+                self._queue.qsize(),
+            )
+
             request.set_gpu_assigned()
 
             if request.gpu_type is not None:
@@ -209,13 +239,34 @@ class SharedEvalPool:
                     except queue.Full:
                         logger.warning(
                             'Requeue failed due to full queue for GPU type %s. '
-                            'Pathological state: all GPUs wrong type AND queue saturated.',
+                            'Pathological state: all GPUs wrong type AND queue saturated. '
+                            'request_id=%s',
                             request.gpu_type,
+                            request.request_id,
                         )
                         request.result = self._gpu_mismatch_result(request, evaluator)
                         request.set_response_sent()
                         request.done.set()
                     continue
+
+            # Log request assigned to GPU
+            logger.info(
+                "Request assigned: request_id=%s task=%s gpu_id=%d queue_time_ms=%.1f",
+                request.request_id,
+                request.task_name,
+                evaluator.gpu_id,
+                request.queue_time_ms(),
+            )
+
+            # Queue depth warning
+            current_depth = self._queue.qsize()
+            if current_depth > self._max_queue_depth * 0.8:
+                logger.warning(
+                    "Queue filling up: %d/%d (%.1f%%) - consider adding more GPUs",
+                    current_depth,
+                    self._max_queue_depth,
+                    100.0 * current_depth / self._max_queue_depth,
+                )
 
             request.set_eval_started()
             result, crash_signal = evaluator.evaluate(
@@ -233,8 +284,9 @@ class SharedEvalPool:
                 request.different_gpu_retry += 1
                 if request.retry_count < MAX_INFRA_RETRIES:
                     logger.warning(
-                        "Infra failure on GPU %d, requeuing to different GPU (attempt %d/%d)",
+                        "Infra failure on GPU %d, requeuing to different GPU (attempt %d/%d) request_id=%s task=%s",
                         evaluator.gpu_id, request.retry_count, MAX_INFRA_RETRIES,
+                        request.request_id, request.task_name,
                     )
                     try:
                         self._queue.put_nowait(request)
@@ -245,6 +297,10 @@ class SharedEvalPool:
                     continue
                 else:
                     result = self._infra_failure_result(request, evaluator)
+                    logger.error(
+                        "Infra failure exhausted retries: request_id=%s task=%s gpu_id=%d retries=%d",
+                        request.request_id, request.task_name, evaluator.gpu_id, request.retry_count,
+                    )
 
             request.set_response_sent()
 
@@ -269,7 +325,81 @@ class SharedEvalPool:
                 "same_container_retry": request.same_container_retry,
                 "different_gpu_retry": request.different_gpu_retry,
                 "crash_signal": request.crash_signal,
+                "request_id": request.request_id,
             }
+
+            # Log eval completion with detailed information
+            success = result.get("success", False)
+            error_type = result.get("error_type")
+            test_results = result.get("test_results", {})
+
+            if success:
+                # Success case - log with INFO level
+                logger.info(
+                    "Eval completed: request_id=%s task=%s gpu_id=%d success=True "
+                    "score_us=%.1f duration_ms=%.1f tests_passed=%d/%d queue_time_ms=%.1f",
+                    request.request_id,
+                    request.task_name,
+                    evaluator.gpu_id,
+                    result.get("score_us", 0),
+                    request.eval_time_ms(),
+                    test_results.get("passed", 0),
+                    test_results.get("total", 0),
+                    request.queue_time_ms(),
+                )
+            else:
+                # Failure case - log with appropriate level based on error type
+                if error_type == "compilation_error":
+                    error_msg = result.get("error", "Unknown error")[:200]
+                    logger.error(
+                        "Compilation failed: request_id=%s task=%s gpu_id=%d error_type=%s error=%s",
+                        request.request_id,
+                        request.task_name,
+                        evaluator.gpu_id,
+                        error_type,
+                        error_msg,
+                    )
+                elif error_type == "eval_failure":
+                    # Test failures or runtime errors
+                    logger.warning(
+                        "Eval failed: request_id=%s task=%s gpu_id=%d error_type=%s "
+                        "tests_passed=%d/%d error=%s",
+                        request.request_id,
+                        request.task_name,
+                        evaluator.gpu_id,
+                        error_type,
+                        test_results.get("passed", 0),
+                        test_results.get("total", 0),
+                        result.get("error", "Unknown")[:100],
+                    )
+                elif error_type == "timeout":
+                    logger.error(
+                        "Eval timeout: request_id=%s task=%s gpu_id=%d duration_ms=%.1f",
+                        request.request_id,
+                        request.task_name,
+                        evaluator.gpu_id,
+                        request.eval_time_ms(),
+                    )
+                else:
+                    # Other error types (infra_failure, gpu_mismatch, queue_full, etc.)
+                    logger.error(
+                        "Eval failed: request_id=%s task=%s gpu_id=%d error_type=%s error=%s",
+                        request.request_id,
+                        request.task_name,
+                        evaluator.gpu_id,
+                        error_type or "unknown",
+                        result.get("error", "Unknown")[:200],
+                    )
+
+            # Slow eval warning (only for successful evals)
+            if success and request.eval_time_ms() > 60000:  # > 1 minute
+                logger.warning(
+                    "Slow eval detected: request_id=%s task=%s gpu_id=%d duration_ms=%.1f (>60s)",
+                    request.request_id,
+                    request.task_name,
+                    evaluator.gpu_id,
+                    request.eval_time_ms(),
+                )
 
             request.result = result
             request.done.set()

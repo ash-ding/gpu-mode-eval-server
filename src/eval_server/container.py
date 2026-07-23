@@ -223,12 +223,16 @@ class PooledKernelEvaluator:
                 returncode = self._proc.returncode
                 desc, is_kernel_bug = check_crash_signature(returncode)
                 logger.error(
-                    "Container exited with %s (code %d) for GPU %d",
-                    desc, returncode, self.gpu_id,
+                    "Container exited with %s (code %d) for GPU %d, task=%s, is_kernel_bug=%s",
+                    desc, returncode, self.gpu_id, task_name, is_kernel_bug,
                 )
                 self.health = ContainerHealth.RECOVERING
 
                 if is_kernel_bug:
+                    logger.warning(
+                        "Kernel bug detected: task=%s gpu_id=%d signal=%s - marking as eval_failure (no retry)",
+                        task_name, self.gpu_id, desc,
+                    )
                     return {
                         "success": False,
                         "score_us": -1_000_000.0,
@@ -240,7 +244,10 @@ class PooledKernelEvaluator:
                     }, returncode
 
                 if same_container_retry == 0:
-                    logger.info("Container crashed (code %d), restarting and retrying on same GPU %d", returncode, self.gpu_id)
+                    logger.info(
+                        "Container crashed (code %d), restarting and retrying on same GPU %d, task=%s",
+                        returncode, self.gpu_id, task_name,
+                    )
                     self._try_restart()
                     return self.evaluate(code, task_name, same_container_retry=1)
 

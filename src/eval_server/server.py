@@ -59,7 +59,23 @@ class EvalHandler(BaseHTTPRequestHandler):
 
         request = EvalRequest(code, task_name, gpu_type)
 
+        # Log request received at HTTP level
+        logger.info(
+            "HTTP request received: request_id=%s task=%s gpu_type=%s code_hash=%s client=%s",
+            request.request_id,
+            task_name,
+            gpu_type or "any",
+            request.code_hash,
+            self.client_address[0],
+        )
+
         if not self.pool.submit(request):
+            logger.warning(
+                "Queue full, rejecting request: request_id=%s task=%s queue_depth=%d",
+                request.request_id,
+                task_name,
+                self.pool.queue_depth(),
+            )
             self._send_json(503, {
                 "error": "Queue full, try again later",
                 "error_type": "queue_full",
