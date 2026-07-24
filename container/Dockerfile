@@ -10,10 +10,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 RUN pip3 install --no-cache-dir \
-    torch==2.5.1 --index-url https://download.pytorch.org/whl/cu129
+    torch==2.11.0 --index-url https://download.pytorch.org/whl/cu129
 
 RUN pip3 install --no-cache-dir \
-    triton==3.3.1 \
+    triton==3.6.0 \
     numpy \
     pyyaml
 
