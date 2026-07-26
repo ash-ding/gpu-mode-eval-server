@@ -7,12 +7,18 @@ writes comprehensive JSON results to stdout. One request at a time.
 
 import io
 import json
+import linecache
 import math
 import os
+import subprocess
 import sys
+import tempfile
 import time
 import traceback
 from contextlib import redirect_stderr, redirect_stdout
+from pathlib import Path
+
+import yaml
 
 
 def make_error_result(error_msg, error_type="eval_failure", logs=None):
@@ -27,15 +33,28 @@ def make_error_result(error_msg, error_type="eval_failure", logs=None):
     }
 
 
+_kernel_counter = 0
+
+
 def compile_kernel(code, task_module):
     """Compile and load the user-submitted kernel code. Returns the module namespace."""
+    global _kernel_counter
+    _kernel_counter += 1
+    source_file = f"/tmp/_kernel_{_kernel_counter}.py"
+    linecache.cache[source_file] = (
+        len(code),
+        None,
+        code.splitlines(True),
+        source_file,
+    )
+
     captured_stdout = io.StringIO()
     captured_stderr = io.StringIO()
     namespace = {"__name__": "__eval__", "__builtins__": __builtins__}
 
     with redirect_stdout(captured_stdout), redirect_stderr(captured_stderr):
         try:
-            exec(compile(code, "<submitted_kernel>", "exec"), namespace)
+            exec(compile(code, source_file, "exec"), namespace)
         except Exception:
             tb = traceback.format_exc()
             return None, {
@@ -199,7 +218,7 @@ def run_benchmarks(namespace, task_module):
 
 def load_task(task_name):
     """Load task definition from /workspace/lib/tasks/<task_name>/."""
-    task_dir = f"/workspace/lib/tasks/{task_name}"
+    task_dir = f"/workspace/lib/{task_name}"
     task_file = os.path.join(task_dir, "task.py")
 
     if not os.path.isfile(task_file):
@@ -215,6 +234,225 @@ def load_task(task_name):
     return namespace, None
 
 
+def _is_popcorn_task(task_name):
+    """Check if task uses Popcorn evaluation (task.yml + eval.py)."""
+    task_dir = Path(f"/workspace/lib/{task_name}")
+    return (task_dir / "task.yml").is_file() and (task_dir / "eval.py").is_file()
+
+
+def _build_test_string(tests):
+    """Serialize test/benchmark dicts to semicolon-delimited format."""
+    lines = []
+    for test in tests:
+        kvs = [f"{k}: {v}" for k, v in test.items()]
+        lines.append("; ".join(kvs))
+    return "\n".join(lines) + "\n"
+
+
+def _run_with_popcorn_pipe(args, cwd, timeout):
+    """Run a subprocess with POPCORN_FD pipe, return parsed result dict."""
+    env = os.environ.copy()
+    pipe_read, pipe_write = os.pipe()
+    env["POPCORN_FD"] = str(pipe_write)
+
+    try:
+        proc = subprocess.run(
+            args,
+            capture_output=True,
+            text=True,
+            check=False,
+            env=env,
+            cwd=cwd,
+            pass_fds=[pipe_write],
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired as e:
+        os.close(pipe_write)
+        os.close(pipe_read)
+        return None, {
+            "stdout": (e.stdout or ""),
+            "stderr": (e.stderr or ""),
+            "timed_out": True,
+        }
+
+    os.close(pipe_write)
+    pipe_output = os.fdopen(pipe_read, "r").read()
+
+    result_dict = {}
+    for line in pipe_output.splitlines():
+        key, _, value = line.partition(":")
+        if key.strip() or value.strip():
+            result_dict[key.strip()] = value.strip()
+
+    return result_dict, {
+        "stdout": proc.stdout,
+        "stderr": proc.stderr,
+        "returncode": proc.returncode,
+    }
+
+
+def evaluate_popcorn(code, task_name):
+    """Evaluate a kernel using the Popcorn protocol (task.yml + eval.py)."""
+    task_dir = Path(f"/workspace/lib/{task_name}")
+
+    with open(task_dir / "task.yml") as f:
+        task_cfg = yaml.safe_load(f)
+
+    tests = task_cfg.get("tests", [])
+    benchmarks = task_cfg.get("benchmarks", [])
+    ranking_by = task_cfg.get("ranking_by", "last")
+    test_timeout = task_cfg.get("test_timeout", 1200)
+    ranked_timeout = task_cfg.get("ranked_timeout", 1200)
+
+    file_specs = task_cfg.get("files", [])
+    main_file = task_cfg.get("config", {}).get("main", "eval.py")
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        for file_spec in file_specs:
+            name = file_spec["name"]
+            source = file_spec["source"]
+            if source == "@SUBMISSION@":
+                (Path(tmpdir) / name).write_text(code)
+            else:
+                src_path = task_dir / source
+                if src_path.is_file():
+                    (Path(tmpdir) / name).write_text(src_path.read_text())
+
+        all_stdout = ""
+        all_stderr = ""
+
+        # Phase 1: correctness tests
+        test_string = _build_test_string(tests)
+        test_file = Path(tmpdir) / "_tests.txt"
+        test_file.write_text(test_string)
+
+        result_dict, proc_info = _run_with_popcorn_pipe(
+            ["python3", main_file, "test", str(test_file)],
+            cwd=tmpdir,
+            timeout=test_timeout,
+        )
+
+        all_stdout += proc_info.get("stdout", "")
+        all_stderr += proc_info.get("stderr", "")
+
+        if result_dict is None:
+            return make_error_result(
+                "Evaluation timed out during correctness tests",
+                "timeout",
+                logs={"stdout": all_stdout, "stderr": all_stderr,
+                      "compilation_log": "", "traceback": None},
+            )
+
+        check_result = result_dict.get("check", "fail")
+        if check_result != "pass":
+            return make_error_result(
+                f"Correctness tests failed (check={check_result})",
+                "eval_failure",
+                logs={"stdout": all_stdout, "stderr": all_stderr,
+                      "compilation_log": "", "traceback": None},
+            )
+
+        # Phase 2: benchmarks (leaderboard mode)
+        bench_string = _build_test_string(benchmarks)
+        bench_file = Path(tmpdir) / "_benchmarks.txt"
+        bench_file.write_text(bench_string)
+
+        bench_result, bench_info = _run_with_popcorn_pipe(
+            ["python3", main_file, "leaderboard", str(bench_file)],
+            cwd=tmpdir,
+            timeout=ranked_timeout,
+        )
+
+        all_stdout += bench_info.get("stdout", "")
+        all_stderr += bench_info.get("stderr", "")
+
+        if bench_result is None:
+            return make_error_result(
+                "Evaluation timed out during benchmarks",
+                "timeout",
+                logs={"stdout": all_stdout, "stderr": all_stderr,
+                      "compilation_log": "", "traceback": None},
+            )
+
+        bench_check = bench_result.get("check", "fail")
+        if bench_check != "pass":
+            return make_error_result(
+                f"Benchmark correctness check failed (check={bench_check})",
+                "eval_failure",
+                logs={"stdout": all_stdout, "stderr": all_stderr,
+                      "compilation_log": "", "traceback": None},
+            )
+
+        # Compute score from benchmark results
+        num_benchmarks = int(bench_result.get("benchmark-count", 0))
+        if num_benchmarks == 0:
+            return make_error_result(
+                "No benchmark results found",
+                "eval_failure",
+                logs={"stdout": all_stdout, "stderr": all_stderr,
+                      "compilation_log": "", "traceback": None},
+            )
+
+        bench_means_ns = []
+        individual_runs = []
+        for i in range(num_benchmarks):
+            key = f"benchmark.{i}.mean"
+            if key not in bench_result:
+                continue
+            mean_ns = float(bench_result[key])
+            bench_means_ns.append(mean_ns)
+            individual_runs.append({
+                "benchmark_id": i,
+                "config": f"benchmark_{i}",
+                "time_us": mean_ns / 1000.0,
+            })
+
+        if not bench_means_ns:
+            return make_error_result(
+                "No valid benchmark timings found",
+                "eval_failure",
+                logs={"stdout": all_stdout, "stderr": all_stderr,
+                      "compilation_log": "", "traceback": None},
+            )
+
+        # ns -> seconds -> geometric mean -> microseconds
+        if ranking_by == "geom":
+            means_sec = [ns / 1e9 for ns in bench_means_ns]
+            geom_mean_sec = math.exp(sum(math.log(s) for s in means_sec) / len(means_sec))
+            score_us = geom_mean_sec * 1e6
+        elif ranking_by == "last":
+            score_us = bench_means_ns[-1] / 1000.0
+        elif ranking_by == "mean":
+            means_sec = [ns / 1e9 for ns in bench_means_ns]
+            score_us = (sum(means_sec) / len(means_sec)) * 1e6
+        else:
+            score_us = bench_means_ns[0] / 1000.0
+
+        return {
+            "success": True,
+            "score_us": score_us,
+            "error": None,
+            "error_type": None,
+            "logs": {
+                "stdout": all_stdout,
+                "stderr": all_stderr,
+                "compilation_log": "",
+                "traceback": None,
+            },
+            "test_results": {
+                "passed": len(tests),
+                "failed": 0,
+                "total": len(tests),
+                "first_failure": None,
+                "details": [],
+            },
+            "benchmark_details": {
+                "geom_mean_us": score_us,
+                "individual_runs": individual_runs,
+            },
+        }
+
+
 def evaluate(request):
     """Evaluate a single kernel submission."""
     code = request.get("code", "")
@@ -224,6 +462,9 @@ def evaluate(request):
         return make_error_result("No code provided", "eval_failure")
     if not task_name:
         return make_error_result("No task_name provided", "eval_failure")
+
+    if _is_popcorn_task(task_name):
+        return evaluate_popcorn(code, task_name)
 
     kernel_ns, compile_logs = compile_kernel(code, {})
     if kernel_ns is None:

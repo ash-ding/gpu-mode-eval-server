@@ -8,7 +8,7 @@ import time
 from datetime import datetime, timezone
 from typing import Optional
 
-from .container import PooledKernelEvaluator
+from .container import ContainerHealth, PooledKernelEvaluator
 from .metrics import metrics
 
 logger = logging.getLogger(__name__)
@@ -217,6 +217,14 @@ class SharedEvalPool:
                 break
 
             if not request.code:
+                continue
+
+            if evaluator.health == ContainerHealth.FAILED:
+                try:
+                    self._queue.put_nowait(request)
+                except queue.Full:
+                    pass
+                time.sleep(10)
                 continue
 
             # Log request received by worker

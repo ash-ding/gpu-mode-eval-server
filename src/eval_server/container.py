@@ -2,6 +2,7 @@
 
 import json
 import logging
+import os
 import subprocess
 import threading
 import time
@@ -120,17 +121,19 @@ class PooledKernelEvaluator:
         self._proc: Optional[subprocess.Popen] = None
         self._container_name = f"eval-gpu-{gpu_id}"
 
-    def start(self):
+    def start(self, _skip_cleanup=False):
         """Start the container process."""
-        self._kill_existing()
+        if not _skip_cleanup:
+            self._kill_existing()
 
         cmd = [
             self.runtime.runtime,
             "run",
-            "--rm",
             "-i",
             "--name", self._container_name,
         ]
+        if self.runtime.runtime == "podman":
+            cmd.append("--replace")
         cmd.extend(self.runtime.gpu_flag(self.gpu_id))
 
         if self.tasks_dir:
@@ -145,24 +148,77 @@ class PooledKernelEvaluator:
             stderr=subprocess.PIPE,
             text=True,
         )
+
+        time.sleep(0.5)
+        if self._proc.poll() is not None:
+            stderr = self._read_stderr()
+            logger.error(
+                "Container failed to start for GPU %d (exit=%d): %s",
+                self.gpu_id, self._proc.returncode, stderr[:500],
+            )
+            self.health = ContainerHealth.FAILED
+            self._proc = None
+            return
+
         self.health = ContainerHealth.HEALTHY
         logger.info("Started container for GPU %d (pid=%d)", self.gpu_id, self._proc.pid)
 
     def _kill_existing(self):
         """Kill any existing container with our name."""
-        try:
-            subprocess.run(
-                [self.runtime.runtime, "rm", "-f", self._container_name],
-                capture_output=True,
-                timeout=10,
-            )
-        except (subprocess.TimeoutExpired, FileNotFoundError):
-            pass
-
         if self._proc and self._proc.poll() is None:
             self._proc.kill()
-            self._proc.wait(timeout=5)
+            try:
+                self._proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
         self._proc = None
+
+        for attempt in range(3):
+            try:
+                subprocess.run(
+                    [self.runtime.runtime, "rm", "-f", self._container_name],
+                    capture_output=True,
+                    timeout=10,
+                )
+            except (subprocess.TimeoutExpired, FileNotFoundError):
+                pass
+            try:
+                check = subprocess.run(
+                    [self.runtime.runtime, "container", "exists", self._container_name],
+                    capture_output=True,
+                    timeout=5,
+                )
+                if check.returncode != 0:
+                    break
+            except (subprocess.TimeoutExpired, FileNotFoundError):
+                break
+            if attempt < 2:
+                time.sleep(1)
+
+        self._kill_gpu_processes()
+
+    def _kill_gpu_processes(self):
+        """Kill orphan host processes still holding this GPU's memory."""
+        try:
+            result = subprocess.run(
+                ["nvidia-smi", "--query-compute-apps=pid",
+                 f"--id={self.gpu_id}", "--format=csv,noheader,nounits"],
+                capture_output=True, text=True, timeout=10,
+            )
+            if result.returncode != 0 or not result.stdout.strip():
+                return
+            for line in result.stdout.strip().splitlines():
+                pid_str = line.strip()
+                if not pid_str:
+                    continue
+                try:
+                    pid = int(pid_str)
+                    os.kill(pid, 9)
+                    logger.info("Killed orphan GPU process %d on GPU %d", pid, self.gpu_id)
+                except (ProcessLookupError, PermissionError, ValueError):
+                    pass
+        except (subprocess.TimeoutExpired, FileNotFoundError):
+            logger.warning("nvidia-smi not available for GPU cleanup on GPU %d", self.gpu_id)
 
     def evaluate(self, code: str, task_name: str, same_container_retry: int = 0) -> tuple[Optional[dict], Optional[int]]:
         """Send an eval request and return (result, crash_signal).
@@ -201,20 +257,34 @@ class PooledKernelEvaluator:
                 self._proc.stdin.write(request)
                 self._proc.stdin.flush()
             except (BrokenPipeError, OSError):
-                logger.error("Container stdin broken for GPU %d", self.gpu_id)
+                stderr = self._read_stderr()
+                logger.error("Container stdin broken for GPU %d: %s", self.gpu_id, stderr[:500] if stderr else "no stderr")
                 self.health = ContainerHealth.RECOVERING
                 return None, None
 
             try:
                 response_line = self._read_with_timeout(self.timeout)
             except TimeoutError:
-                logger.error("Container timeout for GPU %d", self.gpu_id)
                 self.health = ContainerHealth.RECOVERING
                 self._kill_existing()
-                return None, None
+                logger.error(
+                    "Container timeout for GPU %d — kernel hung (not infra failure, no retry)",
+                    self.gpu_id,
+                )
+                self.eval_count += 1
+                return {
+                    "success": False,
+                    "score_us": -1_000_000.0,
+                    "error": f"Kernel timed out after {self.timeout}s on GPU {self.gpu_id}",
+                    "error_type": "timeout",
+                    "logs": {"stdout": "", "stderr": "", "compilation_log": "", "traceback": None},
+                    "test_results": {"passed": 0, "failed": 0, "total": 0, "first_failure": None, "details": []},
+                    "benchmark_details": None,
+                }, None
 
             if response_line is None:
-                logger.error("Container stdout closed for GPU %d", self.gpu_id)
+                stderr = self._read_stderr()
+                logger.error("Container stdout closed for GPU %d: %s", self.gpu_id, stderr[:500] if stderr else "no stderr")
                 self.health = ContainerHealth.RECOVERING
                 returncode = self._proc.returncode if self._proc.poll() is not None else None
                 return None, returncode
@@ -288,13 +358,27 @@ class PooledKernelEvaluator:
 
         return result[0].rstrip("\n") if result[0] else None
 
+    def _read_stderr(self, timeout: float = 2.0) -> str:
+        """Read available stderr without blocking (thread with timeout)."""
+        result = [""]
+        def _read():
+            try:
+                if self._proc and self._proc.stderr:
+                    result[0] = self._proc.stderr.read()[:1000]
+            except Exception:
+                pass
+        thread = threading.Thread(target=_read, daemon=True)
+        thread.start()
+        thread.join(timeout=timeout)
+        return result[0]
+
     def _try_restart(self):
         """Attempt to restart the container."""
         logger.info("Restarting container for GPU %d", self.gpu_id)
         self.health = ContainerHealth.RECOVERING
         try:
             self._kill_existing()
-            self.start()
+            self.start(_skip_cleanup=True)
             self.restart_count += 1
         except Exception:
             logger.exception("Failed to restart container for GPU %d", self.gpu_id)
