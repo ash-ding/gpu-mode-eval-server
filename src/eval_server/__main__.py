@@ -69,6 +69,12 @@ def parse_args():
         help="Log format (default: text)",
     )
     parser.add_argument(
+        "--max-queue-depth",
+        type=int,
+        default=None,
+        help="Max eval queue depth (default: num_gpus * 8)",
+    )
+    parser.add_argument(
         "--config",
         type=str,
         default=None,
@@ -93,6 +99,7 @@ def main():
             "tasks_dir": args.tasks_dir,
             "log_level": args.log_level,
             "log_format": args.log_format,
+            "max_queue_depth": args.max_queue_depth,
         }
 
     setup_logging(level=settings["log_level"], log_format=settings["log_format"])
@@ -125,11 +132,15 @@ def main():
     ]
 
     num_gpus = len(gpu_ids)
-    max_queue_depth = num_gpus * 8
+    max_queue_depth = settings.get("max_queue_depth") or num_gpus * 8
     request_timeout = (max_queue_depth // num_gpus + 1) * settings["timeout"] + 60
     thread_pool_size = max(num_gpus * 128, 512)
 
-    pool = SharedEvalPool(evaluators, gpu_names, eval_timeout=settings["timeout"])
+    pool = SharedEvalPool(
+        evaluators, gpu_names,
+        eval_timeout=settings["timeout"],
+        max_queue_depth=max_queue_depth,
+    )
     pool.start()
 
     server = create_server(

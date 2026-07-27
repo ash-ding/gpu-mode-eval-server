@@ -113,13 +113,14 @@ class SharedEvalPool:
         evaluators: list[PooledKernelEvaluator],
         gpu_names: dict[int, str],
         eval_timeout: int = 530,
+        max_queue_depth: int | None = None,
     ):
         self.evaluators = evaluators
         self.gpu_names = gpu_names
         self.eval_timeout = eval_timeout
 
         num_gpus = len(evaluators)
-        max_depth = num_gpus * 8
+        max_depth = max_queue_depth or num_gpus * 8
         self._queue: queue.Queue[EvalRequest] = queue.Queue(maxsize=max_depth)
         self._max_queue_depth = max_depth
 
